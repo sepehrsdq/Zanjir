@@ -205,10 +205,10 @@ namespace WindscribeChainMini
             top.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-            var dots = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Top, FlowDirection = FlowDirection.LeftToRight };
+            var dots = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Top, HorizontalAlignment = HorizontalAlignment.Left, FlowDirection = FlowDirection.LeftToRight };
             dots.Children.Add(MacDot(MacRed, "\uE8BB", delegate { Close(); }));
             dots.Children.Add(MacDot(MacYellow, "\uE921", delegate { WindowState = WindowState.Minimized; }));
-            dots.Children.Add(MacDot(MacGreen, "\uE922", null));
+            dots.Children.Add(MacDot(MacGreen, "\uE922", delegate { ZoomToggle(); }));
             dots.MouseEnter += delegate
             {
                 foreach (UIElement ch in dots.Children) ((TextBlock)((FrameworkElement)ch).Tag).Visibility = Visibility.Visible;
@@ -438,7 +438,11 @@ namespace WindscribeChainMini
 
         UIElement MacDot(Color c, string mdlGlyph, Action click)
         {
-            var wrap = new Grid { Width = 12, Height = 12, Margin = new Thickness(4, 0, 4, 0), Cursor = Cursors.Hand };
+            var wrap = new Grid
+            {
+                Width = 12, Height = 12, Margin = new Thickness(4, 0, 4, 0),
+                Cursor = Cursors.Hand, Background = Brushes.Transparent
+            };
             var e = new Ellipse { Fill = Br(c), Stroke = Br(Colors.Black, 0x2A), StrokeThickness = 0.75 };
             wrap.Children.Add(e);
             var g = new TextBlock
@@ -451,16 +455,36 @@ namespace WindscribeChainMini
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(0, -0.5, 0, 0),
                 Visibility = Visibility.Collapsed,
+                IsHitTestVisible = false,
                 FlowDirection = FlowDirection.LeftToRight
             };
             wrap.Children.Add(g);
             wrap.Tag = g;
-            e.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs ev)
+            wrap.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs ev)
             {
                 ev.Handled = true;
                 if (click != null) { click(); }
             };
             return wrap;
+        }
+
+        Rect? _savedRect = null;
+        void ZoomToggle()
+        {
+            if (_savedRect == null)
+            {
+                _savedRect = new Rect(Left, Top, Width, Height);
+                var wa = SystemParameters.WorkArea;
+                Left = wa.Left; Top = wa.Top; Width = wa.Width; Height = wa.Height;
+                Say("بزرگ‌نمایی — دوباره بزن برای حالت عادی");
+            }
+            else
+            {
+                Left = _savedRect.Value.Left; Top = _savedRect.Value.Top;
+                Width = _savedRect.Value.Width; Height = _savedRect.Value.Height;
+                _savedRect = null;
+                Say("حالت عادی");
+            }
         }
 
         Button Pill(string txt, Color accent)
