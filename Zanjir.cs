@@ -783,11 +783,11 @@ namespace WindscribeChainMini
             //    fragment/blackhole شدن پکت‌های بزرگ می‌شود؛ ۱۲۸۰ امن است.
             raw = Regex.Replace(raw, "(\"mtu\"\\s*:\\s*)\\d+", "${1}1280");
 
-            // ۲) DNS: با detour روی تونل، اگر تونل بیفتد resolve نام‌ها هم می‌میرد و
-            //    «کل اینترنت قطع» به‌نظر می‌رسد. final را local می‌کنیم.
+            // ۲) DNS: مقدار dns-local روی این سیستم به loop می‌خورد (سیستم‌ریزالور
+            //    خود تانل را صدا می‌زند)؛ پس دوباره به dns-remote برمی‌گردانیم.
             raw = Regex.Replace(raw,
-                "(\"dns\"\\s*:\\s*\\{[\\s\\S]*?\"final\"\\s*:\\s*)\"dns-remote\"",
-                "${1}\"dns-local\"");
+                "(\"dns\"\\s*:\\s*\\{[\\s\\S]*?\"final\"\\s*:\\s*)\"dns-local\"",
+                "${1}\"dns-remote\"");
 
             return raw;
         }

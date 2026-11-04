@@ -16,7 +16,7 @@
         "tag": "dns-local"
       }
     ],
-    "final": "dns-local",
+    "final": "dns-remote",
     "strategy": "prefer_ipv4"
   },
   "inbounds": [
