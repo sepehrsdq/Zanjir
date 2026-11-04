@@ -988,12 +988,12 @@ namespace WindscribeChainMini
     {
         static readonly string CfgPath = IoPath.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
 
-        static Dictionary<string, object> Load()
+        internal static Dictionary<string, object> Load()
         {
             return (Dictionary<string, object>)new JavaScriptSerializer().DeserializeObject(File.ReadAllText(CfgPath));
         }
 
-        static void Save(Dictionary<string, object> cfg)
+        internal static void Save(Dictionary<string, object> cfg)
         {
             var sb = new StringBuilder();
             WriteJson(sb, cfg, 0);
@@ -1061,7 +1061,7 @@ namespace WindscribeChainMini
             else { sb.Append(Convert.ToString(o, System.Globalization.CultureInfo.InvariantCulture)); }
         }
 
-        static Dictionary<string, object> FindSelector(Dictionary<string, object> cfg)
+        internal static Dictionary<string, object> FindSelector(Dictionary<string, object> cfg)
         {
             foreach (var o in (object[])cfg["outbounds"])
             {
@@ -1248,13 +1248,94 @@ namespace WindscribeChainMini
     }
 
     // =========================================================
-    //  پنجرهٔ مدیریت کانفیگ‌ها
+    //  ابزارهای اضافه: پینگ، وضعیت زنده، حذف
+    // =========================================================
+    static class ImportTools
+    {
+        public static string ClashGet(string path)
+        {
+            try
+            {
+                var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("http://127.0.0.1:9090" + path);
+                req.Method = "GET";
+                req.Timeout = 5200;
+                using (var r = (System.Net.HttpWebResponse)req.GetResponse())
+                using (var sr = new StreamReader(r.GetResponseStream(), Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+            catch { return ""; }
+        }
+
+        // خروجی: "۱۲۳" (میلی‌ثانیه) یا "" 
+        public static string PingProxy(string tag)
+        {
+            string js = ClashGet("/proxies/" + Uri.EscapeDataString(tag) + "/delay?url=" + Uri.EscapeDataString("https://www.gstatic.com/generate_204") + "&timeout=4500");
+            if (js == "") return "";
+            try
+            {
+                var d = (Dictionary<string, object>)new JavaScriptSerializer().DeserializeObject(js);
+                if (d != null && d.ContainsKey("delay")) return Convert.ToString(d["delay"]);
+            }
+            catch { }
+            return "";
+        }
+
+        public static string LiveNow()
+        {
+            string js = ClashGet("/proxies/ws-hub");
+            if (js == "") return "";
+            try
+            {
+                var d = (Dictionary<string, object>)new JavaScriptSerializer().DeserializeObject(js);
+                if (d != null && d.ContainsKey("now")) return (string)d["now"];
+            }
+            catch { }
+            return "";
+        }
+
+        public static bool Delete(string tag)
+        {
+            try
+            {
+                var cfg = Importer.Load();
+                var sel = Importer.FindSelector(cfg);
+                if (sel == null) return false;
+                var mem = new List<object>((object[])sel["outbounds"]);
+                bool found = false;
+                foreach (var m in mem) if ((string)m == tag) { found = true; break; }
+                if (!found || mem.Count <= 1) return false;
+                var mem2 = new List<object>();
+                foreach (var m in mem) if ((string)m != tag) mem2.Add(m);
+                sel["outbounds"] = mem2.ToArray();
+                if ((string)sel["default"] == tag) sel["default"] = (string)mem2[0];
+                var obs = new List<object>((object[])cfg["outbounds"]);
+                for (int i = obs.Count - 1; i >= 0; i--)
+                {
+                    var o = obs[i] as Dictionary<string, object>;
+                    if (o != null && (string)o["tag"] == tag) { obs.RemoveAt(i); break; }
+                }
+                cfg["outbounds"] = obs.ToArray();
+                Importer.Save(cfg);
+                return true;
+            }
+            catch { return false; }
+        }
+    }
+
+    // =========================================================
+    //  پنجرهٔ مدیریت کانفیگ‌ها — Material Design
     // =========================================================
     public class ConfigWindow : Window
     {
         Action<string> _say;
         TextBox LinkBox;
         StackPanel ListHost;
+        Border SnackBar;
+        TextBlock SnackTxt;
+        DispatcherTimer SnackTm;
+        Dictionary<string, TextBlock> _delay = new Dictionary<string, TextBlock>();
+        Dictionary<string, Border> _rows = new Dictionary<string, Border>();
+        bool _chainRunning;
 
         static Brush Br(Color c, byte a) { var b = new SolidColorBrush(Color.FromArgb(a, c.R, c.G, c.B)); if (b.CanFreeze) b.Freeze(); return b; }
         static Brush Br(Color c) { var b = new SolidColorBrush(c); if (b.CanFreeze) b.Freeze(); return b; }
@@ -1262,11 +1343,14 @@ namespace WindscribeChainMini
         static readonly Color CGreenLt = Color.FromRgb(0x4A, 0xDE, 0x80);
         static readonly Color CCyan = Color.FromRgb(0x22, 0xD3, 0xEE);
         static readonly Color CMuted = Color.FromRgb(0x8A, 0x97, 0xAD);
+        static readonly Color CRed = Color.FromRgb(0xF8, 0x71, 0x71);
+        static readonly Color CAmber = Color.FromRgb(0xFB, 0xBF, 0x24);
+        static readonly Color CBase = Color.FromRgb(0x0D, 0x14, 0x24);
 
         public ConfigWindow(Action<string> say)
         {
             _say = say;
-            Width = 372; Height = 480;
+            Width = 380; Height = 548;
             Title = "کانفیگ‌ها";
             WindowStyle = WindowStyle.None;
             AllowsTransparency = true;
@@ -1276,8 +1360,14 @@ namespace WindscribeChainMini
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             Topmost = true;
             Build();
-            Loaded += delegate { LoadList(); FadeIn(); };
+            Loaded += delegate
+            {
+                _chainRunning = Process.GetProcessesByName("sing-box").Length > 0;
+                LoadList();
+                FadeIn();
+            };
             MouseLeftButtonDown += delegate { try { DragMove(); } catch { } };
+            PreviewKeyDown += delegate(object s, KeyEventArgs e) { if (e.Key == Key.Escape) Close(); };
         }
 
         void FadeIn()
@@ -1285,30 +1375,60 @@ namespace WindscribeChainMini
             var root = (Grid)Content;
             var glass = (Border)root.Children[0];
             glass.Opacity = 0;
-            var a = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(300)));
+            var a = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(300))) { EasingFunction = new CubicEase() { EasingMode = EasingMode.EaseOut } };
             glass.BeginAnimation(UIElement.OpacityProperty, a);
+        }
+
+        // ---------- اسنک‌بار ----------
+        void Snack(string t)
+        {
+            SnackTxt.Text = t;
+            SnackBar.BeginAnimation(UIElement.OpacityProperty, null);
+            SnackBar.Opacity = 0;
+            var a = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(200)));
+            SnackBar.BeginAnimation(UIElement.OpacityProperty, a);
+            SnackTm.Stop();
+            SnackTm.Start();
+        }
+
+        // ---------- افکت موج ----------
+        void Ripple(Border b)
+        {
+            var br = new SolidColorBrush(Color.FromArgb(0x06, 0xFF, 0xFF, 0xFF));
+            b.Background = br;
+            var ca = new ColorAnimation(Color.FromArgb(0x34, 0xFF, 0xFF, 0xFF), Color.FromArgb(0x06, 0xFF, 0xFF, 0xFF), new Duration(TimeSpan.FromMilliseconds(300)));
+            br.BeginAnimation(SolidColorBrush.ColorProperty, ca);
         }
 
         void Build()
         {
+            SnackTm = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3.6) };
+            SnackTm.Tick += delegate
+            {
+                SnackTm.Stop();
+                var a = new DoubleAnimation(1, 0, new Duration(TimeSpan.FromMilliseconds(350)));
+                SnackBar.BeginAnimation(UIElement.OpacityProperty, a);
+            };
+
             var root = new Grid { Margin = new Thickness(10) };
             var glass = new Border
             {
                 CornerRadius = new CornerRadius(16),
-                Background = Br(Color.FromRgb(0x0D, 0x14, 0x24), 0xE8),
+                Background = Br(CBase, 0xE8),
                 BorderBrush = Br(Colors.White, 0x22),
                 BorderThickness = new Thickness(1),
                 Effect = new DropShadowEffect { BlurRadius = 28, ShadowDepth = 0, Opacity = 0.6, Color = Colors.Black }
             };
             root.Children.Add(glass);
 
-            var g = new Grid { Margin = new Thickness(18) };
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(40) });
-            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            var g = new Grid { Margin = new Thickness(16) };
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(38) });   // سربرگ
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });      // ورودی لینک
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });      // سربرگ فهرست
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // فهرست
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });      // اسنک‌بار
 
-            // سربرگ
+            // ---------- سربرگ ----------
             var head = new Grid();
             var title = new TextBlock { Text = "کانفیگ‌ها", FontSize = 16, FontWeight = FontWeights.Bold, Foreground = Br(Colors.White), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
             head.Children.Add(title);
@@ -1323,148 +1443,337 @@ namespace WindscribeChainMini
             Grid.SetRow(head, 0);
             g.Children.Add(head);
 
-            // ورود لینک
-            var lbl = new TextBlock { Text = "لینک vless را اینجا بچسبانید:", FontSize = 12, Foreground = Br(CMuted), Margin = new Thickness(0, 8, 0, 5) };
-            Grid.SetRow(lbl, 1);
-            g.Children.Add(lbl);
-
-            var linkRow = new Grid();
-            linkRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            linkRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            // ---------- کارت افزودن ----------
+            var addCard = new Border
+            {
+                CornerRadius = new CornerRadius(12),
+                Background = Br(Colors.White, 0x05),
+                BorderBrush = Br(Colors.White, 0x12),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(12),
+                Margin = new Thickness(0, 4, 0, 6)
+            };
+            var ag = new Grid();
+            ag.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            ag.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            var linkStack = new StackPanel();
+            linkStack.Children.Add(new TextBlock { Text = "افزودن کانفیگ — هر خط یک لینک vless", FontSize = 11, Foreground = Br(CMuted), Margin = new Thickness(2, 0, 0, 5) });
             LinkBox = new TextBox
             {
                 FontSize = 11, FontFamily = new FontFamily("Consolas"),
-                Background = Br(Colors.White, 0x08), Foreground = Br(Colors.White),
+                Background = Br(Colors.White, 0x06), Foreground = Br(Colors.White),
                 BorderBrush = Br(Colors.White, 0x20), BorderThickness = new Thickness(1),
-                Padding = new Thickness(8, 6, 8, 6), VerticalContentAlignment = VerticalAlignment.Center,
-                FlowDirection = FlowDirection.LeftToRight, Margin = new Thickness(0, 0, 8, 0)
+                Padding = new Thickness(8, 5, 8, 5),
+                AcceptsReturn = true, TextWrapping = TextWrapping.NoWrap,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Height = 58, FlowDirection = FlowDirection.LeftToRight
             };
-            Grid.SetColumn(LinkBox, 0);
-            linkRow.Children.Add(LinkBox);
-            var addBtn = new Button
+            linkStack.Children.Add(LinkBox);
+            Grid.SetColumn(linkStack, 0);
+            ag.Children.Add(linkStack);
+
+            var fab = new Border
             {
-                Content = "افزودن", Width = 84, Height = 32,
-                Foreground = Br(Colors.White), FontSize = 12,
-                Background = Br(CGreen, 0x30), BorderBrush = Br(CGreen, 0x66), BorderThickness = new Thickness(1),
-                Cursor = Cursors.Hand
+                Width = 46, Height = 46, CornerRadius = new CornerRadius(23),
+                Background = new LinearGradientBrush(CGreen, Color.FromRgb(0x15, 0x8A, 0x47), new Point(0, 0), new Point(0, 1)),
+                Effect = new DropShadowEffect { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.5, Color = CGreen },
+                Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(10, 0, 0, 2)
             };
-            var bt = new ControlTemplate(typeof(Button));
-            var bd = new FrameworkElementFactory(typeof(Border));
-            bd.SetValue(Border.CornerRadiusProperty, new CornerRadius(10));
-            bd.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Border.BackgroundProperty));
-            bd.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(Border.BorderBrushProperty));
-            var cp = new FrameworkElementFactory(typeof(ContentPresenter));
-            cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
-            cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
-            bd.AppendChild(cp);
-            bt.VisualTree = bd;
-            addBtn.Template = bt;
-            addBtn.Click += delegate { AddClicked(); };
-            Grid.SetColumn(addBtn, 1);
-            linkRow.Children.Add(addBtn);
-            Grid.SetRow(linkRow, 2);
-            g.Children.Add(linkRow);
+            fab.Child = new TextBlock
+            {
+                Text = "\uE710", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 16,
+                Foreground = Br(Colors.White), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
+            };
+            var fabSc = new ScaleTransform(1, 1);
+            fab.RenderTransform = fabSc; fab.RenderTransformOrigin = new Point(0.5, 0.5);
+            fab.MouseEnter += delegate { SpringTo(fabSc, 1.08); };
+            fab.MouseLeave += delegate { SpringTo(fabSc, 1.0); };
+            fab.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; AddClicked(); };
+            Grid.SetColumn(fab, 1);
+            ag.Children.Add(fab);
+            addCard.Child = ag;
+            Grid.SetRow(addCard, 1);
+            g.Children.Add(addCard);
 
-            // فهرست
-            var lbl2 = new TextBlock { Text = "خروجی‌های فعال (کلیک = انتخاب):", FontSize = 12, Foreground = Br(CMuted), Margin = new Thickness(0, 14, 0, 5) };
-            Grid.SetRow(lbl2, 3);
-            g.Children.Add(lbl2);
+            // ---------- سربرگ فهرست ----------
+            var lh = new Grid { Margin = new Thickness(2, 4, 2, 4) };
+            lh.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            lh.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            lh.Children.Add(new TextBlock { Text = "خروجی‌ها — کلیک = فعال‌سازی", FontSize = 11.5, Foreground = Br(CMuted), VerticalAlignment = VerticalAlignment.Center });
+            var pingAll = new TextBlock
+            {
+                Text = "پینگ همه", FontSize = 11.5, Foreground = Br(CCyan),
+                Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center, FontWeight = FontWeights.SemiBold
+            };
+            pingAll.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; PingAll(); };
+            Grid.SetColumn(pingAll, 1);
+            lh.Children.Add(pingAll);
+            Grid.SetRow(lh, 2);
+            g.Children.Add(lh);
 
-            var sc = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(0, 26, 0, 0) };
+            // ---------- فهرست ----------
+            var sc = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
             ListHost = new StackPanel();
             sc.Content = ListHost;
             Grid.SetRow(sc, 3);
             g.Children.Add(sc);
 
+            // ---------- اسنک‌بار ----------
+            SnackBar = new Border
+            {
+                CornerRadius = new CornerRadius(9),
+                Background = Br(Colors.White, 0x0C),
+                BorderBrush = Br(Colors.White, 0x16),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(10, 6, 10, 6),
+                Margin = new Thickness(0, 8, 0, 0), Opacity = 0
+            };
+            SnackTxt = new TextBlock { FontSize = 11, Foreground = Br(Colors.White, 0xE6), TextWrapping = TextWrapping.Wrap };
+            SnackBar.Child = SnackTxt;
+            Grid.SetRow(SnackBar, 4);
+            g.Children.Add(SnackBar);
+
             glass.Child = g;
             Content = root;
         }
 
+        static void SpringTo(ScaleTransform st, double to)
+        {
+            var e = new BackEase { Amplitude = 0.5, EasingMode = EasingMode.EaseOut };
+            var a = new DoubleAnimation(st.ScaleX, to, new Duration(TimeSpan.FromMilliseconds(240))) { EasingFunction = e };
+            st.BeginAnimation(ScaleTransform.ScaleXProperty, a);
+            var b = new DoubleAnimation(st.ScaleY, to, new Duration(TimeSpan.FromMilliseconds(240))) { EasingFunction = e };
+            st.BeginAnimation(ScaleTransform.ScaleYProperty, b);
+        }
+
+        // ---------- فهرست ----------
         void LoadList()
         {
             ListHost.Children.Clear();
-            bool chainRunning = Process.GetProcessesByName("sing-box").Length > 0;
+            _delay.Clear();
+            _rows.Clear();
+            string live = _chainRunning ? ImportTools.LiveNow() : "";
+            bool any = false;
             foreach (var m in Importer.Members())
             {
+                any = true;
                 string tag = m.Key;
-                bool active = m.Value == "active";
-                var b = new Border
-                {
-                    Height = 36, CornerRadius = new CornerRadius(9),
-                    Background = Br(Colors.White, active ? (byte)0x10 : (byte)0x06),
-                    BorderBrush = active ? Br(CGreen, (byte)0x55) : Br(Colors.White, (byte)0x10),
-                    BorderThickness = new Thickness(1),
-                    Margin = new Thickness(0, 2, 0, 2), Cursor = Cursors.Hand
-                };
-                var row = new Grid();
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                var dot = new Ellipse { Width = 9, Height = 9, Fill = Br(active ? CGreenLt : CMuted), Margin = new Thickness(10, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
-                Grid.SetColumn(dot, 0);
-                row.Children.Add(dot);
-                var name = new TextBlock
-                {
-                    Text = tag, FontFamily = new FontFamily("Consolas"), FontSize = 12,
-                    Foreground = Br(Colors.White, active ? (byte)0xF0 : (byte)0xB0),
-                    VerticalAlignment = VerticalAlignment.Center, FlowDirection = FlowDirection.LeftToRight
-                };
-                Grid.SetColumn(name, 1);
-                row.Children.Add(name);
-                if (active)
-                {
-                    var live = new TextBlock
-                    {
-                        Text = chainRunning ? "فعال — در حال استفاده" : "فعال (با استارت بعدی)",
-                        FontSize = 10, Foreground = Br(active ? CGreenLt : CMuted),
-                        VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 0, 10, 0)
-                    };
-                    Grid.SetColumn(live, 2);
-                    row.Children.Add(live);
-                }
-                b.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
-                {
-                    e.Handled = true;
-                    SwitchTo(tag);
-                };
-                ListHost.Children.Add(b);
+                bool active = live != "" ? tag == live : m.Value == "active";
+                ListHost.Children.Add(MakeRow(tag, active));
             }
-            if (ListHost.Children.Count == 0)
-                ListHost.Children.Add(new TextBlock { Text = "چیزی نیست", Foreground = Br(CMuted), FontSize = 11, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 10, 0, 0) });
+            if (!any)
+                ListHost.Children.Add(new TextBlock { Text = "هنوز کانفیگی نیست — لینک vless را بالای صفحه بچسبان", Foreground = Br(CMuted), FontSize = 11, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 16, 0, 0) });
         }
 
+        UIElement MakeRow(string tag, bool active)
+        {
+            var b = new Border
+            {
+                Height = 46, CornerRadius = new CornerRadius(10),
+                Background = Br(Colors.White, 0x06),
+                BorderBrush = active ? Br(CGreen, 0x55) : Br(Colors.White, 0x10),
+                BorderThickness = new Thickness(1),
+                Margin = new Thickness(0, 2.5, 0, 2.5), Cursor = Cursors.Hand
+            };
+            _rows[tag] = b;
+            var g = new Grid();
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(22) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(30) });
+
+            // دکمهٔ پینگ
+            var ping = new Border
+            {
+                Width = 26, Height = 26, CornerRadius = new CornerRadius(13),
+                Background = Br(CCyan, _chainRunning ? (byte)0x16 : (byte)0x08),
+                Cursor = Cursors.Hand, VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Opacity = _chainRunning ? 1.0 : 0.4
+            };
+            ping.Child = new TextBlock
+            {
+                Text = "\uE72C", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 11,
+                Foreground = Br(CCyan), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
+            };
+            ping.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                PingOne(tag);
+            };
+            Grid.SetColumn(ping, 0);
+            g.Children.Add(ping);
+
+            // نقطهٔ وضعیت
+            var dot = new Ellipse { Width = 9, Height = 9, Fill = Br(active ? CGreenLt : CMuted), VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) };
+            Grid.SetColumn(dot, 1);
+            g.Children.Add(dot);
+
+            // نام + وضعیت
+            var nameStack = new StackPanel { VerticalAlignment = VerticalAlignment.Center };
+            nameStack.Children.Add(new TextBlock
+            {
+                Text = tag, FontFamily = new FontFamily("Consolas"), FontSize = 11.5,
+                Foreground = Br(Colors.White, active ? (byte)0xF0 : (byte)0xB4),
+                FlowDirection = FlowDirection.LeftToRight
+            });
+            nameStack.Children.Add(new TextBlock
+            {
+                Text = active ? (_chainRunning ? "فعال — در حال استفاده" : "فعال (با استارت بعدی)") : "",
+                FontSize = 9.5, Foreground = Br(CGreenLt), Margin = new Thickness(0, 1, 0, 0)
+            });
+            Grid.SetColumn(nameStack, 2);
+            g.Children.Add(nameStack);
+
+            // نشان تأخیر
+            var delayT = new TextBlock
+            {
+                Text = "", FontFamily = new FontFamily("Consolas"), FontSize = 11,
+                Foreground = Br(CMuted), VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 8, 0), FlowDirection = FlowDirection.LeftToRight
+            };
+            _delay[tag] = delayT;
+            Grid.SetColumn(delayT, 3);
+            g.Children.Add(delayT);
+
+            // دکمهٔ حذف
+            var del = new Border
+            {
+                Width = 26, Height = 26, CornerRadius = new CornerRadius(13),
+                Background = Br(Colors.White, 0x05), Cursor = Cursors.Hand,
+                VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center
+            };
+            del.Child = new TextBlock
+            {
+                Text = "\uE74D", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 11,
+                Foreground = Br(CMuted), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center
+            };
+            del.MouseEnter += delegate { del.Background = Br(CRed, 0x22); ((TextBlock)del.Child).Foreground = Br(CRed); };
+            del.MouseLeave += delegate { del.Background = Br(Colors.White, 0x05); ((TextBlock)del.Child).Foreground = Br(CMuted); };
+            del.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                DeleteRow(tag);
+            };
+            Grid.SetColumn(del, 4);
+            g.Children.Add(del);
+
+            b.Child = g;
+            b.MouseEnter += delegate { b.BorderBrush = Br(Colors.White, 0x2A); };
+            b.MouseLeave += delegate { b.BorderBrush = active ? Br(CGreen, 0x55) : Br(Colors.White, 0x10); };
+            b.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                Ripple(b);
+                SwitchTo(tag);
+            };
+            return b;
+        }
+
+        // ---------- اعمال ----------
         void SwitchTo(string tag)
         {
-            if (!Importer.SetDefault(tag)) { _say("[×] تغییر کانفیگ ناموفق"); return; }
-            if (Process.GetProcessesByName("sing-box").Length > 0)
+            if (!Importer.SetDefault(tag)) { Snack("[×] تغییر ناموفق"); return; }
+            if (_chainRunning)
             {
                 string err = Importer.LiveSwitch(tag);
-                _say(err == "" ? "[✓] کانفیگ عوض شد: " + tag + " (بدون ری‌استارت)" : "[✓] ثبت شد: " + tag + " — سوییچ زنده نشد (" + err + ")");
+                Snack(err == "" ? "فعال شد: " + tag + " (بدون ری‌استارت)" : "ثبت شد: " + tag + " — سوییچ زنده نشد");
             }
             else
             {
-                _say("[✓] ثبت شد: " + tag + " — با روشن کردن زنجیره اعمال می‌شود");
+                Snack("ثبت شد: " + tag + " — با روشن کردن زنجیره اعمال می‌شود");
             }
+            if (_say != null) _say("[✓] کانفیگ فعال: " + tag);
             LoadList();
         }
 
+        void DeleteRow(string tag)
+        {
+            var r = MessageBox.Show("«" + tag + "» حذف شود؟", "حذف کانفیگ", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+            if (r != MessageBoxResult.Yes) return;
+            string live = _chainRunning ? ImportTools.LiveNow() : "";
+            if (!ImportTools.Delete(tag)) { Snack("حذف نشد — حداقل یک خروجی باید بماند"); return; }
+            if (live == tag)
+            {
+                var mem = Importer.Members();
+                if (mem.Count > 0) Importer.LiveSwitch(mem[0].Key);
+            }
+            Snack("حذف شد: " + tag);
+            if (_say != null) _say("[✓] کانفیگ حذف شد: " + tag);
+            LoadList();
+        }
+
+        // ---------- پینگ ----------
+        void PingOne(string tag)
+        {
+            if (!_chainRunning) { Snack("برای پینگ، اول زنجیره را روشن کن"); return; }
+            TextBlock dt;
+            if (!_delay.TryGetValue(tag, out dt)) return;
+            dt.Text = "...";
+            dt.Foreground = Br(CMuted);
+            Task.Run(delegate
+            {
+                string ms = ImportTools.PingProxy(tag);
+                Dispatcher.Invoke(delegate { SetDelay(tag, ms); });
+            });
+        }
+
+        void PingAll()
+        {
+            if (!_chainRunning) { Snack("برای پینگ، اول زنجیره را روشن کن"); return; }
+            var tags = new List<string>(_delay.Keys);
+            Snack("در حال پینگ " + tags.Count + " کانفیگ...");
+            Task.Run(delegate
+            {
+                foreach (string t in tags)
+                {
+                    string ms = ImportTools.PingProxy(t);
+                    Dispatcher.Invoke(delegate { SetDelay(t, ms); });
+                    Thread.Sleep(250);
+                }
+            });
+        }
+
+        void SetDelay(string tag, string ms)
+        {
+            TextBlock dt;
+            if (!_delay.TryGetValue(tag, out dt)) return;
+            if (ms == "")
+            {
+                dt.Text = "نشد";
+                dt.Foreground = Br(CRed);
+            }
+            else
+            {
+                int v = 0;
+                int.TryParse(ms, out v);
+                dt.Text = ms + "ms";
+                dt.Foreground = Br(v < 350 ? CGreenLt : (v < 900 ? CAmber : CRed));
+            }
+        }
+
+        // ---------- افزودن چندتایی ----------
         void AddClicked()
         {
             string text = LinkBox.Text.Trim();
-            if (text == "") { _say("[×] اول لینک را وارد کن"); return; }
-            int okCount = 0; string lastTag = "";
+            if (text == "") { Snack("اول لینک را وارد کن"); return; }
+            int okCount = 0;
+            string lastTag = "";
             foreach (string lineRaw in text.Replace("\r", "").Split('\n'))
             {
                 string line = lineRaw.Trim();
                 if (!line.StartsWith("vless://", StringComparison.OrdinalIgnoreCase)) continue;
                 string r = Importer.ImportLink(line);
                 if (r.StartsWith("imp-")) { okCount++; lastTag = r; }
-                else { _say("[×] " + r); return; }
+                else { Snack("[×] " + r); if (_say != null) _say("[×] " + r); return; }
             }
-            if (okCount == 0) { _say("[×] لینک vless معتبری پیدا نشد"); return; }
+            if (okCount == 0) { Snack("لینک vless معتبری پیدا نشد"); return; }
             LinkBox.Clear();
+            if (_chainRunning) Importer.LiveSwitch(lastTag);
             LoadList();
-            _say("[✓] " + okCount + " کانفیگ اضافه شد (" + lastTag + ") — زنجیره را خاموش/روشن کن");
+            Snack(okCount + " کانفیگ اضافه شد و فعال شد");
+            if (_say != null) _say("[✓] " + okCount + " کانفیگ اضافه شد (" + lastTag + ")");
         }
     }
 
