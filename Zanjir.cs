@@ -372,6 +372,7 @@ namespace WindscribeChainMini
             row.ColumnDefinitions.Add(new ColumnDefinition());
             row.ColumnDefinitions.Add(new ColumnDefinition());
             row.ColumnDefinitions.Add(new ColumnDefinition());
+            row.ColumnDefinitions.Add(new ColumnDefinition());
             BtnTest = Pill("تست", CCyan);
             BtnTest.Click += delegate { Fire(TestChain, "در حال تست مسیر..."); };
             Grid.SetColumn(BtnTest, 0);
@@ -380,6 +381,10 @@ namespace WindscribeChainMini
             BtnIP.Click += delegate { Fire(CheckIp, "در حال بررسی IP..."); };
             Grid.SetColumn(BtnIP, 1);
             row.Children.Add(BtnIP);
+            var BtnCfg = Pill("کانفیگ", CGreen);
+            BtnCfg.Click += delegate { new ConfigWindow(new Action<string>(Say)).ShowDialog(); };
+            Grid.SetColumn(BtnCfg, 2);
+            row.Children.Add(BtnCfg);
 
             var autoWrap = new Border
             {
@@ -404,7 +409,7 @@ namespace WindscribeChainMini
                 ev.Handled = true;
                 ToggleAuto();
             };
-            Grid.SetColumn(autoWrap, 2);
+            Grid.SetColumn(autoWrap, 3);
             row.Children.Add(autoWrap);
             Grid.SetRow(row, 5);
             g.Children.Add(row);
@@ -976,11 +981,504 @@ namespace WindscribeChainMini
         }
     }
 
+    // =========================================================
+    //  پردازش لینک vless و مدیریت کانفیگ‌ها
+    // =========================================================
+    static class Importer
+    {
+        static readonly string CfgPath = IoPath.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+
+        static Dictionary<string, object> Load()
+        {
+            return (Dictionary<string, object>)new JavaScriptSerializer().DeserializeObject(File.ReadAllText(CfgPath));
+        }
+
+        static void Save(Dictionary<string, object> cfg)
+        {
+            var sb = new StringBuilder();
+            WriteJson(sb, cfg, 0);
+            File.WriteAllText(CfgPath, sb.ToString(), new UTF8Encoding(false));
+        }
+
+        static string Esc(string s)
+        {
+            var sb = new StringBuilder();
+            foreach (char ch in s)
+            {
+                if (ch == '"' || ch == '\\') { sb.Append('\\').Append(ch); }
+                else if (ch == '\n') { sb.Append("\\n"); }
+                else if (ch == '\r') { }
+                else { sb.Append(ch); }
+            }
+            return sb.ToString();
+        }
+
+        static void WriteJson(StringBuilder sb, object o, int ind)
+        {
+            string pad = new string(' ', ind * 2);
+            if (o is Dictionary<string, object>)
+            {
+                var d = (Dictionary<string, object>)o;
+                if (d.Count == 0) { sb.Append("{}"); return; }
+                sb.Append("{\n");
+                bool first = true;
+                foreach (var kv in d)
+                {
+                    if (!first) sb.Append(",\n");
+                    first = false;
+                    sb.Append(pad).Append("  \"").Append(Esc(kv.Key)).Append("\": ");
+                    WriteJson(sb, kv.Value, ind + 1);
+                }
+                sb.Append('\n').Append(pad).Append('}');
+            }
+            else if (o is object[])
+            {
+                var arr = (object[])o;
+                if (arr.Length == 0) { sb.Append("[]"); return; }
+                bool allPrim = true;
+                foreach (var x in arr) if (x is Dictionary<string, object> || x is object[]) { allPrim = false; break; }
+                if (allPrim && arr.Length <= 8)
+                {
+                    sb.Append('[');
+                    for (int i = 0; i < arr.Length; i++) { if (i > 0) sb.Append(", "); WriteJson(sb, arr[i], ind); }
+                    sb.Append(']');
+                }
+                else
+                {
+                    sb.Append("[\n");
+                    for (int i = 0; i < arr.Length; i++)
+                    {
+                        if (i > 0) sb.Append(",\n");
+                        sb.Append(pad).Append("  ");
+                        WriteJson(sb, arr[i], ind + 1);
+                    }
+                    sb.Append('\n').Append(pad).Append(']');
+                }
+            }
+            else if (o is string) { sb.Append('"').Append(Esc((string)o)).Append('"'); }
+            else if (o is bool) { sb.Append((bool)o ? "true" : "false"); }
+            else if (o == null) { sb.Append("null"); }
+            else { sb.Append(Convert.ToString(o, System.Globalization.CultureInfo.InvariantCulture)); }
+        }
+
+        static Dictionary<string, object> FindSelector(Dictionary<string, object> cfg)
+        {
+            foreach (var o in (object[])cfg["outbounds"])
+            {
+                var d = o as Dictionary<string, object>;
+                if (d != null && (string)d["type"] == "selector" && (string)d["tag"] == "ws-hub") return d;
+            }
+            return null;
+        }
+
+        static int NextIndex(Dictionary<string, object> cfg)
+        {
+            int mx = 0;
+            foreach (var o in (object[])cfg["outbounds"])
+            {
+                var d = o as Dictionary<string, object>;
+                if (d != null)
+                {
+                    string t = (string)d["tag"];
+                    if (t != null && t.StartsWith("imp-"))
+                    {
+                        int n;
+                        if (int.TryParse(t.Substring(4), out n) && n > mx) mx = n;
+                    }
+                }
+            }
+            return mx + 1;
+        }
+
+        // خروجی: موفق = نام تگ جدید، ناموفق = متن خطا
+        public static string ImportLink(string link)
+        {
+            link = (link ?? "").Trim().Trim('"');
+            if (!link.StartsWith("vless://", StringComparison.OrdinalIgnoreCase)) return "لینک باید با vless:// شروع شود";
+            try
+            {
+                string body = link.Substring(8);
+                int hash = body.IndexOf('#');
+                body = hash >= 0 ? body.Substring(0, hash) : body;
+                int q = body.IndexOf('?');
+                var qp = new Dictionary<string, string>();
+                if (q >= 0)
+                {
+                    foreach (string kv in body.Substring(q + 1).Split('&'))
+                    {
+                        int eq = kv.IndexOf('=');
+                        if (eq > 0) qp[kv.Substring(0, eq).ToLower()] = Uri.UnescapeDataString(kv.Substring(eq + 1));
+                    }
+                    body = body.Substring(0, q);
+                }
+                int at = body.LastIndexOf('@');
+                if (at < 0) return "ساختار لینک نامعتبر است";
+                string uuid = body.Substring(0, at);
+                string hostport = body.Substring(at + 1);
+                int colon = hostport.LastIndexOf(':');
+                if (colon < 0) return "پورت در لینک پیدا نشد";
+                string host = hostport.Substring(0, colon);
+                int port = int.Parse(hostport.Substring(colon + 1));
+                string type = qp.ContainsKey("type") ? qp["type"] : "tcp";
+                string security = qp.ContainsKey("security") ? qp["security"] : "none";
+
+                var ob = new Dictionary<string, object>();
+                var cfg = Load();
+                ob["type"] = "vless";
+                ob["tag"] = "imp-" + NextIndex(cfg);
+                ob["server"] = host;
+                ob["server_port"] = port;
+                ob["uuid"] = uuid;
+                ob["packet_encoding"] = "xudp";
+                if (qp.ContainsKey("flow") && qp["flow"] != "none") ob["flow"] = qp["flow"];
+
+                if (security == "reality" || security == "tls")
+                {
+                    var tls = new Dictionary<string, object>();
+                    tls["enabled"] = true;
+                    if (qp.ContainsKey("sni")) tls["server_name"] = qp["sni"];
+                    var utls = new Dictionary<string, object>();
+                    utls["enabled"] = true;
+                    utls["fingerprint"] = qp.ContainsKey("fp") ? qp["fp"] : "chrome";
+                    tls["utls"] = utls;
+                    if (security == "reality")
+                    {
+                        if (!qp.ContainsKey("pbk")) return "لینک Reality کلید عمومی (pbk) ندارد";
+                        var rl = new Dictionary<string, object>();
+                        rl["enabled"] = true;
+                        rl["public_key"] = qp["pbk"];
+                        rl["short_id"] = qp.ContainsKey("sid") ? qp["sid"] : "";
+                        tls["reality"] = rl;
+                    }
+                    ob["tls"] = tls;
+                }
+
+                if (type == "ws")
+                {
+                    var tr = new Dictionary<string, object>();
+                    tr["type"] = "ws";
+                    tr["path"] = qp.ContainsKey("path") ? qp["path"] : "/";
+                    var hd = new Dictionary<string, object>();
+                    hd["Host"] = qp.ContainsKey("host") ? qp["host"] : (qp.ContainsKey("sni") ? qp["sni"] : host);
+                    tr["headers"] = hd;
+                    ob["transport"] = tr;
+                }
+                else if (type == "grpc")
+                {
+                    var tr = new Dictionary<string, object>();
+                    tr["type"] = "grpc";
+                    if (qp.ContainsKey("servicename")) tr["service_name"] = qp["servicename"];
+                    ob["transport"] = tr;
+                }
+                else if (type != "tcp")
+                {
+                    return "این نوع transport پشتیبانی نمی‌شود: " + type;
+                }
+
+                var obs = new List<object>((object[])cfg["outbounds"]);
+                var sel = FindSelector(cfg);
+                if (sel == null) return "سکشنر ws-hub در کانفیگ پیدا نشد";
+                int insertAt = obs.Count;
+                for (int i = 0; i < obs.Count; i++)
+                {
+                    var o = obs[i] as Dictionary<string, object>;
+                    if (o != null && (string)o["type"] == "direct") { insertAt = i; break; }
+                }
+                obs.Insert(insertAt, ob);
+                var mem = new List<object>((object[])sel["outbounds"]);
+                mem.Add(ob["tag"]);
+                sel["outbounds"] = mem.ToArray();
+                sel["default"] = ob["tag"];
+                cfg["outbounds"] = obs.ToArray();
+                Save(cfg);
+                return (string)ob["tag"];
+            }
+            catch (Exception ex)
+            {
+                return "خطا در پردازش لینک: " + ex.Message;
+            }
+        }
+
+        public static List<KeyValuePair<string, string>> Members()
+        {
+            var res = new List<KeyValuePair<string, string>>();
+            try
+            {
+                var cfg = Load();
+                var sel = FindSelector(cfg);
+                if (sel == null) return res;
+                string def = sel.ContainsKey("default") ? (string)sel["default"] : "";
+                foreach (var m in (object[])sel["outbounds"])
+                    res.Add(new KeyValuePair<string, string>((string)m, (string)m == def ? "active" : ""));
+            }
+            catch { }
+            return res;
+        }
+
+        public static bool SetDefault(string tag)
+        {
+            try
+            {
+                var cfg = Load();
+                var sel = FindSelector(cfg);
+                if (sel == null) return false;
+                sel["default"] = tag;
+                Save(cfg);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        public static string LiveSwitch(string tag)
+        {
+            try
+            {
+                var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("http://127.0.0.1:9090/proxies/ws-hub");
+                req.Method = "PUT";
+                req.ContentType = "application/json";
+                req.Timeout = 2500;
+                byte[] bytes = Encoding.UTF8.GetBytes("{\"name\": \"" + tag.Replace("\"", "") + "\"}");
+                req.ContentLength = bytes.Length;
+                using (System.IO.Stream s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
+                using (var r = (System.Net.HttpWebResponse)req.GetResponse()) { }
+                return "";
+            }
+            catch (Exception ex) { return ex.Message; }
+        }
+    }
+
+    // =========================================================
+    //  پنجرهٔ مدیریت کانفیگ‌ها
+    // =========================================================
+    public class ConfigWindow : Window
+    {
+        Action<string> _say;
+        TextBox LinkBox;
+        StackPanel ListHost;
+
+        static Brush Br(Color c, byte a) { var b = new SolidColorBrush(Color.FromArgb(a, c.R, c.G, c.B)); if (b.CanFreeze) b.Freeze(); return b; }
+        static Brush Br(Color c) { var b = new SolidColorBrush(c); if (b.CanFreeze) b.Freeze(); return b; }
+        static readonly Color CGreen = Color.FromRgb(0x22, 0xC5, 0x5E);
+        static readonly Color CGreenLt = Color.FromRgb(0x4A, 0xDE, 0x80);
+        static readonly Color CCyan = Color.FromRgb(0x22, 0xD3, 0xEE);
+        static readonly Color CMuted = Color.FromRgb(0x8A, 0x97, 0xAD);
+
+        public ConfigWindow(Action<string> say)
+        {
+            _say = say;
+            Width = 372; Height = 480;
+            Title = "کانفیگ‌ها";
+            WindowStyle = WindowStyle.None;
+            AllowsTransparency = true;
+            Background = Brushes.Transparent;
+            FlowDirection = FlowDirection.RightToLeft;
+            FontFamily = new FontFamily("Segoe UI");
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Topmost = true;
+            Build();
+            Loaded += delegate { LoadList(); FadeIn(); };
+            MouseLeftButtonDown += delegate { try { DragMove(); } catch { } };
+        }
+
+        void FadeIn()
+        {
+            var root = (Grid)Content;
+            var glass = (Border)root.Children[0];
+            glass.Opacity = 0;
+            var a = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(300)));
+            glass.BeginAnimation(UIElement.OpacityProperty, a);
+        }
+
+        void Build()
+        {
+            var root = new Grid { Margin = new Thickness(10) };
+            var glass = new Border
+            {
+                CornerRadius = new CornerRadius(16),
+                Background = Br(Color.FromRgb(0x0D, 0x14, 0x24), 0xE8),
+                BorderBrush = Br(Colors.White, 0x22),
+                BorderThickness = new Thickness(1),
+                Effect = new DropShadowEffect { BlurRadius = 28, ShadowDepth = 0, Opacity = 0.6, Color = Colors.Black }
+            };
+            root.Children.Add(glass);
+
+            var g = new Grid { Margin = new Thickness(18) };
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(40) });
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+
+            // سربرگ
+            var head = new Grid();
+            var title = new TextBlock { Text = "کانفیگ‌ها", FontSize = 16, FontWeight = FontWeights.Bold, Foreground = Br(Colors.White), HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+            head.Children.Add(title);
+            var close = new Grid
+            {
+                Width = 12, Height = 12, Background = Brushes.Transparent,
+                Cursor = Cursors.Hand, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Center
+            };
+            close.Children.Add(new Ellipse { Fill = Br(Color.FromRgb(0xFF, 0x5F, 0x57)), Stroke = Br(Colors.Black, 0x2A), StrokeThickness = 0.75 });
+            close.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e) { e.Handled = true; Close(); };
+            head.Children.Add(close);
+            Grid.SetRow(head, 0);
+            g.Children.Add(head);
+
+            // ورود لینک
+            var lbl = new TextBlock { Text = "لینک vless را اینجا بچسبانید:", FontSize = 12, Foreground = Br(CMuted), Margin = new Thickness(0, 8, 0, 5) };
+            Grid.SetRow(lbl, 1);
+            g.Children.Add(lbl);
+
+            var linkRow = new Grid();
+            linkRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            linkRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            LinkBox = new TextBox
+            {
+                FontSize = 11, FontFamily = new FontFamily("Consolas"),
+                Background = Br(Colors.White, 0x08), Foreground = Br(Colors.White),
+                BorderBrush = Br(Colors.White, 0x20), BorderThickness = new Thickness(1),
+                Padding = new Thickness(8, 6, 8, 6), VerticalContentAlignment = VerticalAlignment.Center,
+                FlowDirection = FlowDirection.LeftToRight, Margin = new Thickness(0, 0, 8, 0)
+            };
+            Grid.SetColumn(LinkBox, 0);
+            linkRow.Children.Add(LinkBox);
+            var addBtn = new Button
+            {
+                Content = "افزودن", Width = 84, Height = 32,
+                Foreground = Br(Colors.White), FontSize = 12,
+                Background = Br(CGreen, 0x30), BorderBrush = Br(CGreen, 0x66), BorderThickness = new Thickness(1),
+                Cursor = Cursors.Hand
+            };
+            var bt = new ControlTemplate(typeof(Button));
+            var bd = new FrameworkElementFactory(typeof(Border));
+            bd.SetValue(Border.CornerRadiusProperty, new CornerRadius(10));
+            bd.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Border.BackgroundProperty));
+            bd.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(Border.BorderBrushProperty));
+            var cp = new FrameworkElementFactory(typeof(ContentPresenter));
+            cp.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
+            cp.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
+            bd.AppendChild(cp);
+            bt.VisualTree = bd;
+            addBtn.Template = bt;
+            addBtn.Click += delegate { AddClicked(); };
+            Grid.SetColumn(addBtn, 1);
+            linkRow.Children.Add(addBtn);
+            Grid.SetRow(linkRow, 2);
+            g.Children.Add(linkRow);
+
+            // فهرست
+            var lbl2 = new TextBlock { Text = "خروجی‌های فعال (کلیک = انتخاب):", FontSize = 12, Foreground = Br(CMuted), Margin = new Thickness(0, 14, 0, 5) };
+            Grid.SetRow(lbl2, 3);
+            g.Children.Add(lbl2);
+
+            var sc = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(0, 26, 0, 0) };
+            ListHost = new StackPanel();
+            sc.Content = ListHost;
+            Grid.SetRow(sc, 3);
+            g.Children.Add(sc);
+
+            glass.Child = g;
+            Content = root;
+        }
+
+        void LoadList()
+        {
+            ListHost.Children.Clear();
+            bool chainRunning = Process.GetProcessesByName("sing-box").Length > 0;
+            foreach (var m in Importer.Members())
+            {
+                string tag = m.Key;
+                bool active = m.Value == "active";
+                var b = new Border
+                {
+                    Height = 36, CornerRadius = new CornerRadius(9),
+                    Background = Br(Colors.White, active ? (byte)0x10 : (byte)0x06),
+                    BorderBrush = active ? Br(CGreen, (byte)0x55) : Br(Colors.White, (byte)0x10),
+                    BorderThickness = new Thickness(1),
+                    Margin = new Thickness(0, 2, 0, 2), Cursor = Cursors.Hand
+                };
+                var row = new Grid();
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                var dot = new Ellipse { Width = 9, Height = 9, Fill = Br(active ? CGreenLt : CMuted), Margin = new Thickness(10, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
+                Grid.SetColumn(dot, 0);
+                row.Children.Add(dot);
+                var name = new TextBlock
+                {
+                    Text = tag, FontFamily = new FontFamily("Consolas"), FontSize = 12,
+                    Foreground = Br(Colors.White, active ? (byte)0xF0 : (byte)0xB0),
+                    VerticalAlignment = VerticalAlignment.Center, FlowDirection = FlowDirection.LeftToRight
+                };
+                Grid.SetColumn(name, 1);
+                row.Children.Add(name);
+                if (active)
+                {
+                    var live = new TextBlock
+                    {
+                        Text = chainRunning ? "فعال — در حال استفاده" : "فعال (با استارت بعدی)",
+                        FontSize = 10, Foreground = Br(active ? CGreenLt : CMuted),
+                        VerticalAlignment = VerticalAlignment.Center, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 0, 10, 0)
+                    };
+                    Grid.SetColumn(live, 2);
+                    row.Children.Add(live);
+                }
+                b.MouseLeftButtonDown += delegate(object s, MouseButtonEventArgs e)
+                {
+                    e.Handled = true;
+                    SwitchTo(tag);
+                };
+                ListHost.Children.Add(b);
+            }
+            if (ListHost.Children.Count == 0)
+                ListHost.Children.Add(new TextBlock { Text = "چیزی نیست", Foreground = Br(CMuted), FontSize = 11, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 10, 0, 0) });
+        }
+
+        void SwitchTo(string tag)
+        {
+            if (!Importer.SetDefault(tag)) { _say("[×] تغییر کانفیگ ناموفق"); return; }
+            if (Process.GetProcessesByName("sing-box").Length > 0)
+            {
+                string err = Importer.LiveSwitch(tag);
+                _say(err == "" ? "[✓] کانفیگ عوض شد: " + tag + " (بدون ری‌استارت)" : "[✓] ثبت شد: " + tag + " — سوییچ زنده نشد (" + err + ")");
+            }
+            else
+            {
+                _say("[✓] ثبت شد: " + tag + " — با روشن کردن زنجیره اعمال می‌شود");
+            }
+            LoadList();
+        }
+
+        void AddClicked()
+        {
+            string text = LinkBox.Text.Trim();
+            if (text == "") { _say("[×] اول لینک را وارد کن"); return; }
+            int okCount = 0; string lastTag = "";
+            foreach (string lineRaw in text.Replace("\r", "").Split('\n'))
+            {
+                string line = lineRaw.Trim();
+                if (!line.StartsWith("vless://", StringComparison.OrdinalIgnoreCase)) continue;
+                string r = Importer.ImportLink(line);
+                if (r.StartsWith("imp-")) { okCount++; lastTag = r; }
+                else { _say("[×] " + r); return; }
+            }
+            if (okCount == 0) { _say("[×] لینک vless معتبری پیدا نشد"); return; }
+            LinkBox.Clear();
+            LoadList();
+            _say("[✓] " + okCount + " کانفیگ اضافه شد (" + lastTag + ") — زنجیره را خاموش/روشن کن");
+        }
+    }
+
     public static class Program
     {
         [STAThread]
-        public static void Main()
+        public static void Main(string[] args)
         {
+            if (args != null && args.Length >= 2 && args[0] == "import")
+            {
+                string r = Importer.ImportLink(args[1]);
+                Environment.ExitCode = r.StartsWith("imp-") ? 0 : 1;
+                return;
+            }
             bool admin = false;
             try
             {
