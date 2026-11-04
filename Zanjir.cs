@@ -69,6 +69,12 @@ namespace WindscribeChainMini
         readonly JavaScriptSerializer _ser = new JavaScriptSerializer();
         bool _auto;
 
+        // ---------- پایش سلامت مسیر ----------
+        // اگر مسیر انتخاب‌شده بیفتد، خودکار روی رله سوییچ می‌کنیم تا کل نت قطع نشود
+        int _failStreak = 0;
+        bool _healthBusy = false;
+        readonly DispatcherTimer _health = new DispatcherTimer();
+
         // ---------- عناصر ----------
         Border RootGlass;
         DropShadowEffect GlassShadow;
@@ -108,6 +114,10 @@ namespace WindscribeChainMini
             _tm.Interval = TimeSpan.FromMilliseconds(1200);
             _tm.Tick += PollTick;
             _tm.Start();
+
+            _health.Interval = TimeSpan.FromSeconds(15);
+            _health.Tick += HealthTick;
+            _health.Start();
 
             Loaded += delegate { EnterAnim(); InitAuto(); ApplyStateVisual(); };
             MouseLeftButtonDown += delegate { try { DragMove(); } catch { } };
@@ -674,16 +684,19 @@ namespace WindscribeChainMini
 
         void StartChain()
         {
-            string ifname = "Wi-Fi";
+            // اینترفیس فیزیکی را خودکار پیدا می‌کنیم (قبلاً «Wi-Fi» هاردکد بود و روی
+            // Ethernet/هات‌اسپات یا وقتی نام آداپتر عوض می‌شود زنجیره را می‌شکست).
+            string ifname = PickPhysicalInterface();
             try
             {
                 string raw = File.ReadAllText(Cfg);
                 raw = Regex.Replace(raw, "\"default_interface\"\\s*:\\s*\"[^\"]*\"", "\"default_interface\": \"" + ifname + "\"");
+                raw = NormalizeConfig(raw);
                 File.WriteAllText(Cfg, raw, new UTF8Encoding(false));
             }
             catch (Exception ex) { Say("[×] خطا در کانفیگ: " + ex.Message); return; }
 
-            Say("... زنجیره راه‌اندازی می‌شود");
+            Say("... زنجیره روی " + ifname + " راه‌اندازی می‌شود");
 
             try
             {
@@ -718,6 +731,112 @@ namespace WindscribeChainMini
             }
             if (ok) Say("[✓] روشن شد — حالا ویندسکرایب را با Stealth وصل کن");
             else Say("[×] بالا نیامد — " + TailLog(1));
+        }
+
+        // ================================================================
+        //  انتخاب اینترفیس فیزیکی + اصلاح خودکار کانفیگ
+        // ================================================================
+        static bool IsVirtualIface(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return true;
+            string n = name.ToLowerInvariant();
+            string[] bad = { "windscribe", "wschain", "throne", "wireguard", "wintun",
+                             "tap-", "tun", "vpn", "hyper-v", "vmware", "virtualbox",
+                             "loopback", "bluetooth", "wi-fi direct", "npcap" };
+            foreach (string b in bad) if (n.IndexOf(b, StringComparison.Ordinal) >= 0) return true;
+            return false;
+        }
+
+        static string PickPhysicalInterface()
+        {
+            string pick = null, fallback = null;
+            try
+            {
+                foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    var t = ni.NetworkInterfaceType;
+                    if (t == System.Net.NetworkInformation.NetworkInterfaceType.Loopback ||
+                        t == System.Net.NetworkInformation.NetworkInterfaceType.Tunnel) continue;
+                    if (IsVirtualIface(ni.Name)) continue;
+
+                    bool hasGw = false;
+                    foreach (var g in ni.GetIPProperties().GatewayAddresses)
+                        if (g != null && g.Address != null &&
+                            g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+                            !g.Address.Equals(System.Net.IPAddress.Any)) { hasGw = true; break; }
+                    if (!hasGw) continue;
+
+                    if (fallback == null) fallback = ni.Name;
+                    if (t == System.Net.NetworkInformation.NetworkInterfaceType.Wireless80211) { pick = ni.Name; break; }
+                    if (pick == null) pick = ni.Name;
+                }
+            }
+            catch { }
+            return pick != null ? pick : (fallback != null ? fallback : "Wi-Fi");
+        }
+
+        // کانفیگ‌های قدیمی را بدون دست‌زدن به بقیهٔ مقادیر اصلاح می‌کند
+        static string NormalizeConfig(string raw)
+        {
+            // ۱) MTU تونل: در تونل تودرتو (ویندسکرایب داخل VLESS) مقدار ۱۵۰۰ باعث
+            //    fragment/blackhole شدن پکت‌های بزرگ می‌شود؛ ۱۲۸۰ امن است.
+            raw = Regex.Replace(raw, "(\"mtu\"\\s*:\\s*)\\d+", "${1}1280");
+
+            // ۲) DNS: با detour روی تونل، اگر تونل بیفتد resolve نام‌ها هم می‌میرد و
+            //    «کل اینترنت قطع» به‌نظر می‌رسد. final را local می‌کنیم.
+            raw = Regex.Replace(raw,
+                "(\"dns\"\\s*:\\s*\\{[\\s\\S]*?\"final\"\\s*:\\s*)\"dns-remote\"",
+                "${1}\"dns-local\"");
+
+            return raw;
+        }
+
+        // ================================================================
+        //  پایش سلامت زنجیره + سوییچ خودکار به رله
+        // ================================================================
+        void HealthTick(object s, EventArgs e)
+        {
+            if (_healthBusy || _busy) return;
+            if (!ProcAlive() || !TunUp()) { _failStreak = 0; return; }
+            _healthBusy = true;
+            Task.Run(delegate
+            {
+                string code = RunCurl("-s -m 6 -x socks5h://127.0.0.1:20808 -o NUL -w \"%{http_code}\" http://cp.cloudflare.com/generate_204", 9);
+                try
+                {
+                    Dispatcher.Invoke(delegate
+                    {
+                        _healthBusy = false;
+                        if (code == "204") { _failStreak = 0; return; }
+                        _failStreak++;
+                        if (_failStreak >= 3)
+                        {
+                            _failStreak = 0;
+                            TryFallback();
+                        }
+                    });
+                }
+                catch { _healthBusy = false; }
+            });
+        }
+
+        void TryFallback()
+        {
+            try
+            {
+                string cur = Importer.CurrentDefault();
+                if (string.IsNullOrEmpty(cur) || !cur.StartsWith("imp-")) return; // فقط مسیر مستقیم
+                string target = Importer.FindHub();
+                if (string.IsNullOrEmpty(target) || target == cur) return;
+
+                string err = Importer.LiveSwitch(target);
+                Importer.SetDefault(target);
+                Say(err.Length == 0
+                    ? "[!] مسیر مستقیم افتاد — خودکار روی " + target + " (رله) سوییچ شد"
+                    : "[!] مسیر مستقیم افتاد — سوییچ خودکار ناموفق: " + err);
+            }
+            catch (Exception ex) { Say("[!] سوییچ خودکار ناموفق: " + ex.Message); }
         }
 
         string TailLog(int n)
@@ -1227,6 +1346,33 @@ namespace WindscribeChainMini
                 return true;
             }
             catch { return false; }
+        }
+
+        public static string CurrentDefault()
+        {
+            try
+            {
+                var sel = FindSelector(Load());
+                return sel != null && sel.ContainsKey("default") ? (string)sel["default"] : null;
+            }
+            catch { return null; }
+        }
+
+        // اولین مسیر غیرمستقیم (رله) برای fallback خودکار
+        public static string FindHub()
+        {
+            try
+            {
+                var sel = FindSelector(Load());
+                if (sel == null) return null;
+                foreach (var m in (object[])sel["outbounds"])
+                {
+                    string t = (string)m;
+                    if (t != null && t.StartsWith("hub-")) return t;
+                }
+            }
+            catch { }
+            return null;
         }
 
         public static string LiveSwitch(string tag)
