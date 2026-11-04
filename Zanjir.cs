@@ -1307,7 +1307,11 @@ namespace WindscribeChainMini
                 var mem = new List<object>((object[])sel["outbounds"]);
                 mem.Add(ob["tag"]);
                 sel["outbounds"] = mem.ToArray();
-                sel["default"] = ob["tag"];
+                // کانفیگ تازه فقط اضافه می‌شود و مسیر فعال را عوض نمی‌کند.
+                // (قبلاً هر لینک تازه default را می‌گرفت و کاربر ناخواسته روی
+                //  مسیر مستقیم می‌افتاد؛ همان چیزی که باعث قطعی می‌شد.)
+                if (!sel.ContainsKey("default") || sel["default"] == null || ((string)sel["default"]).Length == 0)
+                    sel["default"] = ob["tag"];
                 cfg["outbounds"] = obs.ToArray();
                 Save(cfg);
                 return (string)ob["tag"];
@@ -1916,9 +1920,8 @@ namespace WindscribeChainMini
             }
             if (okCount == 0) { Snack("لینک vless معتبری پیدا نشد"); return; }
             LinkBox.Clear();
-            if (_chainRunning) Importer.LiveSwitch(lastTag);
             LoadList();
-            Snack(okCount + " کانفیگ اضافه شد و فعال شد");
+            Snack(okCount + " کانفیگ اضافه شد — روی ردیف بزن تا فعال شود");
             if (_say != null) _say("[✓] " + okCount + " کانفیگ اضافه شد (" + lastTag + ")");
         }
     }
