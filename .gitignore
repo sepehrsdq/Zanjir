@@ -12,3 +12,8 @@ shot.png
 *.old.exe
 .bom*
 __pycache__/
+
+# تنظیمات و سکرت لوکال
+.env
+.env.*
+!.env.example
